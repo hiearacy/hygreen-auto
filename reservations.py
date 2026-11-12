@@ -66,7 +66,7 @@ def _room(s: str) -> str:
     if "침대두개" in s or "트윈" in s or "싱글침대2" in s: return "침대두개"
     if "큰침대" in s: return "큰침대"
     if "욕조" in s: return "욕조방"
-    if "푹신" in s: return "푹신한방"
+    if "푹신" in s or "폭신한방" in s: return "푹신한방"  # Conservative common OCR variant.
     if "따뜻" in s or "따듯" in s: return "따뜻한방"
     return ""  # Unrecognized room must be reviewed, not silently misclassified.
 
