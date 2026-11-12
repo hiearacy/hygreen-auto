@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+.venv/
+*.xlsx
+*.xlsm
+*.xls
+*.zip
+*.log
+.env
+settings.json
+imported_files.json
+*.spec
+build/
+dist/
+*.exe
