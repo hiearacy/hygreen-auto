@@ -1,5 +1,7 @@
 import unittest
-from pc_kakao_ocr import parse_ocr, signature, classify_chat_header
+from unittest.mock import patch
+from pc_kakao_ocr import (parse_ocr, signature, classify_chat_header,
+                          WindowCandidate, looks_like_kakao, scan_chats, ChatObservation)
 from test_reservations import NOL, CANCEL, YEOGI
 
 class TestPCOCRParsing(unittest.TestCase):
@@ -28,6 +30,24 @@ class TestPCOCRParsing(unittest.TestCase):
         self.assertIsNone(classify_chat_header("친구 채팅\nNOL 아고다 예약"))
         self.assertIsNone(classify_chat_header("여기어때\nNOL 알림"))
         self.assertIsNone(classify_chat_header("카카오톡\n기타 채팅"))
+
+    def test_kakao_process_names_and_manual_fallback(self):
+        self.assertTrue(looks_like_kakao(WindowCandidate(1, "", "KakaoTalkBeta.exe", "", 0, 0, 300, 500)))
+        self.assertTrue(looks_like_kakao(WindowCandidate(2, "", "unknown.exe", "EVA_Window_Dblclk", 0, 0, 300, 500)))
+        self.assertFalse(looks_like_kakao(WindowCandidate(3, "", "msedge.exe", "Chrome_WidgetWin_1", 0, 0, 300, 500)))
+
+    def test_manual_selection_requires_correct_chat_header(self):
+        wins = [WindowCandidate(9, "", "UnknownHosted.exe", "", 100, 300, 310, 500),
+                WindowCandidate(11, "", "UnknownHosted.exe", "", 420, 300, 310, 500)]
+        with patch("pc_kakao_ocr.check_ocr", return_value=""), \
+             patch("pc_kakao_ocr.enumerate_window_candidates", return_value=wins), \
+             patch("pc_kakao_ocr._detect_chat_name", side_effect=lambda hwnd: "여기어때" if hwnd == 9 else "NOL 알림"), \
+             patch("pc_kakao_ocr.capture_one", side_effect=lambda hwnd,title: ChatObservation(title,"",())):
+            obs = scan_chats({"여기어때": 9, "NOL 알림": 11})
+            self.assertEqual([x.title for x in obs], ["여기어때", "NOL 알림"])
+            mismatch = scan_chats({"여기어때": 11, "NOL 알림": 9})
+            self.assertEqual(len(mismatch), 2)
+            self.assertTrue(all(not x.reservations and "확인하지 못했습니다" in x.warning for x in mismatch))
 
     def test_stable_signature(self):
         a = parse_ocr("NOL 알림", NOL)[0]
