@@ -36,7 +36,7 @@ def _check_win32() -> None:
 
 
 def find_kakao_windows() -> list[tuple[int, str]]:
-    """Only accept chat windows owned by KakaoTalk.exe, never similarly titled apps."""
+    """Find KakaoTalk-owned windows; Win32 titles are often blank, so do not filter titles here."""
     _check_win32()
     import psutil
     import win32gui
@@ -47,20 +47,59 @@ def find_kakao_windows() -> list[tuple[int, str]]:
     def each(hwnd, unused):
         if not win32gui.IsWindowVisible(hwnd) or win32gui.IsIconic(hwnd):
             return
-        raw = win32gui.GetWindowText(hwnd).strip()
-        title = next((n for n in CHAT_TITLES if raw == n), None)
-        if title is None:
-            return
         try:
+            x0, y0, x1, y1 = win32gui.GetClientRect(hwnd)
+            if x1 - x0 < MIN_WINDOW_WIDTH or y1 - y0 < MIN_WINDOW_HEIGHT:
+                return
             _, pid = win32process.GetWindowThreadProcessId(hwnd)
             if psutil.Process(pid).name().lower() != "kakaotalk.exe":
                 return
-        except (psutil.Error, OSError):
+            windows.append((hwnd, win32gui.GetWindowText(hwnd).strip()))
+        except (psutil.Error, OSError, ValueError):
             return
-        windows.append((hwnd, title))
 
     win32gui.EnumWindows(each, None)
     return windows
+
+
+def classify_chat_header(text: str) -> str | None:
+    """Identify only allowlisted chat rooms from the header's first two OCR lines."""
+    lines = [re.sub(r"\s+", "", line).lower() for line in text.splitlines() if line.strip()]
+    lines = lines[:2]
+    yeogi = any("여기어때" in line for line in lines)
+    nol = any("nol알림" in line for line in lines)
+    if yeogi == nol:
+        return None
+    return "여기어때" if yeogi else "NOL 알림"
+
+
+def _detect_chat_name(hwnd: int) -> str | None:
+    """OCR only the visible top header; never use clicks or keyboard input."""
+    import mss
+    import win32gui
+    from PIL import Image, ImageEnhance
+    import pytesseract
+
+    left, top = win32gui.ClientToScreen(hwnd, (0, 0))
+    x0, y0, x1, y1 = win32gui.GetClientRect(hwnd)
+    width, height = x1 - x0, y1 - y0
+    if width < MIN_WINDOW_WIDTH or height < MIN_WINDOW_HEIGHT:
+        return None
+    if _foreground_obscures(hwnd, left, top, width, height):
+        return None
+    with mss.mss() as ctx:
+        monitor = ctx.monitors[0]
+        if not (monitor["left"] <= left and monitor["top"] <= top and
+                left + width <= monitor["left"] + monitor["width"] and
+                top + height <= monitor["top"] + monitor["height"]):
+            return None
+        region = {"left": left, "top": top, "width": min(width, 460), "height": min(height, 100)}
+        shot = ctx.grab(region)
+        header = Image.frombytes("RGB", shot.size, shot.rgb)
+    scaled = header.resize((header.width * 3, header.height * 3), resample=3)
+    scaled = ImageEnhance.Contrast(scaled).enhance(1.25)
+    result = pytesseract.image_to_string(scaled, lang="kor+eng", config="--psm 6")
+    return classify_chat_header(result)
 
 
 def tesseract_executable() -> str:
@@ -250,10 +289,28 @@ def scan_chats() -> list[ChatObservation]:
     issue = check_ocr()
     if issue:
         raise RuntimeError(issue)
-    windows = find_kakao_windows()
-    if not windows:
-        raise RuntimeError("열려 있는 카카오톡 '여기어때' 또는 'NOL 알림' 독립 채팅창을 찾지 못했습니다.")
-    return [capture_one(hwnd, title) for hwnd, title in windows]
+    candidates = find_kakao_windows()
+    if not candidates:
+        raise RuntimeError("카카오톡 소유의 보이는 창을 찾지 못했습니다. PC 카카오톡 실행 여부를 확인하세요.")
+    observations: list[ChatObservation] = []
+    titles_found: set[str] = set()
+    for hwnd, raw_title in candidates:
+        try:
+            recognized = _detect_chat_name(hwnd)
+            if recognized is None and raw_title in CHAT_TITLES:
+                recognized = raw_title
+            if recognized is None or recognized in titles_found:
+                continue
+            observations.append(capture_one(hwnd, recognized))
+            titles_found.add(recognized)
+        except Exception:
+            continue
+    if not observations:
+        raise RuntimeError(
+            f"카카오톡 창 {len(candidates)}개 발견, 하지만 NOL 알림/여기어때 채팅방을 구분하지 못했습니다. "
+            "두 채팅창의 상단 이름이 화면에 보이는지 확인하세요."
+        )
+    return observations
 
 
 def signature(r: Reservation) -> tuple:
