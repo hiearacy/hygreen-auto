@@ -112,32 +112,42 @@ def classify_chat_header(text: str) -> str | None:
 
 
 def _detect_chat_name(hwnd: int) -> str | None:
-    """OCR only the visible top header; never use clicks or keyboard input."""
+    """Read KakaoTalk's small title region rather than the mixed header + notices."""
     import mss
     import win32gui
-    from PIL import Image, ImageEnhance
+    from PIL import Image, ImageEnhance, ImageOps
     import pytesseract
 
     left, top = win32gui.ClientToScreen(hwnd, (0, 0))
-    x0, y0, x1, y1 = win32gui.GetClientRect(hwnd)
-    width, height = x1 - x0, y1 - y0
+    rect = win32gui.GetClientRect(hwnd)
+    width, height = rect[2] - rect[0], rect[3] - rect[1]
     if width < MIN_WINDOW_WIDTH or height < MIN_WINDOW_HEIGHT:
         return None
     if _foreground_obscures(hwnd, left, top, width, height):
         return None
+    # Header text begins roughly 45 px from the client's left edge. Keep the
+    # screenshot strictly within this window and exclude the first chat bubble.
+    x = min(40, max(0, width - 150))
+    h = min(45, height)
+    cw = min(width - x, 260)
     with mss.mss() as ctx:
         monitor = ctx.monitors[0]
-        if not (monitor["left"] <= left and monitor["top"] <= top and
-                left + width <= monitor["left"] + monitor["width"] and
-                top + height <= monitor["top"] + monitor["height"]):
+        if not _on_monitor(monitor, left + x, top, cw, h):
             return None
-        region = {"left": left, "top": top, "width": min(width, 460), "height": min(height, 100)}
-        shot = ctx.grab(region)
+        shot = ctx.grab({"left": left + x, "top": top,
+                         "width": cw, "height": h})
         header = Image.frombytes("RGB", shot.size, shot.rgb)
-    scaled = header.resize((header.width * 3, header.height * 3), resample=3)
-    scaled = ImageEnhance.Contrast(scaled).enhance(1.25)
-    result = pytesseract.image_to_string(scaled, lang="kor+eng", config="--psm 6")
-    return classify_chat_header(result)
+    enlarged = header.resize((cw * 4, h * 4), Image.Resampling.LANCZOS)
+    gray = ImageOps.autocontrast(ImageOps.grayscale(enlarged))
+    gray = ImageEnhance.Contrast(gray).enhance(1.6)
+    header_text = pytesseract.image_to_string(gray, lang="kor+eng", config="--psm 6")
+    return classify_chat_header(header_text)
+
+
+def _on_monitor(monitor: dict, left: int, top: int, width: int, height: int) -> bool:
+    return (monitor["left"] <= left and monitor["top"] <= top and
+            left + width <= monitor["left"] + monitor["width"] and
+            top + height <= monitor["top"] + monitor["height"])
 
 
 def tesseract_executable() -> str:
@@ -173,19 +183,108 @@ def check_ocr() -> str:
 
 
 def image_to_text(img) -> str:
-    """Use only local Tesseract; transient image exists in RAM, not on disk."""
+    """OCR one isolated message bubble (not the full chat desktop)."""
     import pytesseract
-    from PIL import ImageOps, ImageEnhance
+    from PIL import Image, ImageOps
 
     w, h = img.size
-    if w < MIN_WINDOW_WIDTH or h < MIN_WINDOW_HEIGHT:
+    if w < 75 or h < 25:
         return ""
-    # Read Korean text in narrow chat bubbles at an enlarged resolution.
-    img = img.convert("RGB")
-    enlarged = img.resize((w * 3, h * 3), resample=3)
-    gray = ImageOps.autocontrast(ImageOps.grayscale(enlarged), cutoff=1)
-    gray = ImageEnhance.Sharpness(gray).enhance(1.25)
-    return pytesseract.image_to_string(gray, lang="kor+eng", config="--psm 11").strip()
+    image = ImageOps.autocontrast(ImageOps.grayscale(img.convert("RGB")))
+    image = image.resize((w * 4, h * 4), Image.Resampling.LANCZOS)
+    # Uniform text lines are much more reliable with PSM 6 than PSM 11 when
+    # Korean, amounts, dates and phone numbers share one narrow bubble.
+    return pytesseract.image_to_string(image, lang="kor+eng", config="--psm 6").strip()
+
+
+def _bubble_row_active(pixels, width: int, y: int) -> bool:
+    """Identify a left-aligned white/yellow KakaoTalk notice against blue chat UI.
+
+    Never scan the white footer: it must have the KakaoTalk blue background to
+    the left of the candidate message rectangle.
+    """
+    bg_x = max(12, min(width - 1, round(width * 0.07)))
+    br, bg, bb = pixels[bg_x, y]
+    if not (bb - br >= 14 and bg - br >= 7):
+        return False
+    x0, x1 = max(45, round(width * .14)), min(width-35, round(width * .71))
+    if x1 <= x0:
+        return False
+    hits = 0
+    scanned = 0
+    for x in range(x0, x1, 3):
+        r,g,b = pixels[x,y]
+        white = min(r,g,b) >= 235 and max(r,g,b)-min(r,g,b) < 24
+        yellow = r >= 215 and g >= 160 and b <= 115
+        hits += int(white or yellow)
+        scanned += 1
+    return scanned > 0 and hits >= scanned * .52
+
+
+def _light_run(pixels, width: int, y: int) -> tuple[int,int] | None:
+    """Locate the horizontal extent of the mostly uniform bubble background."""
+    runs=[]
+    start=None
+    for x in range(25,width-12):
+        r,g,b=pixels[x,y]
+        good=(min(r,g,b)>=235 and max(r,g,b)-min(r,g,b)<24) or (r>=215 and g>=160 and b<=115)
+        if good and start is None:
+            start=x
+        elif not good and start is not None:
+            if x-start>=65:
+                runs.append((start,x))
+            start=None
+    if start is not None and width-12-start>=65:
+        runs.append((start,width-12))
+    runs=[run for run in runs if run[0] <= width * .4]
+    return max(runs,key=lambda ab:ab[1]-ab[0]) if runs else None
+
+
+def message_bubble_boxes(img) -> list[tuple[int,int,int,int]]:
+    """Find separate visible white/yellow notification bubbles.
+
+    Uses only visible pixels from the user-chosen chat, never private KakaoTalk
+    files or hooks. A missing/ambiguous bubble is omitted rather than joined to
+    adjacent bookings; this prevents mixing names, amounts and booking numbers.
+    """
+    image=img.convert("RGB")
+    width,height=image.size
+    if width < MIN_WINDOW_WIDTH or height < MIN_WINDOW_HEIGHT:
+        return []
+    pix=image.load()
+    spans=[]
+    active_start=None
+    last_seen=None
+    # Browser bars + message input area contain unrelated text.
+    for y in range(40, max(40,height-100)):
+        active=_bubble_row_active(pix,width,y)
+        if active:
+            if active_start is None:
+                active_start=y
+            last_seen=y
+        elif active_start is not None and y-last_seen>8:
+            if last_seen-active_start>=34:
+                spans.append((active_start,last_seen+1))
+            active_start=None
+            last_seen=None
+    if active_start is not None and last_seen-active_start>=34:
+        spans.append((active_start,last_seen+1))
+    boxes=[]
+    for y0,y1 in spans:
+        # At least one empty/light text row should expose the bubble's extent.
+        probes=[y0+3,min(y1-1,y0+10),(y0+y1)//2]
+        runs=[_light_run(pix,width,yy) for yy in probes]
+        runs=[r for r in runs if r is not None]
+        if not runs:
+            continue
+        # The top of a notice may be yellow while the body is white; they share
+        # the same x-extent. Prefer longest clean horizontal run.
+        left,right=max(runs,key=lambda ab:ab[1]-ab[0])
+        # Leave a margin for clipped bubble edges, but not adjacent chats.
+        box=(max(0,left-5),max(0,y0-5),min(width-8,max(right+10,int(width*.77))),min(height,y1+5))
+        if box[2]-box[0] >= 90:
+            boxes.append(box)
+    return boxes[-5:]
 
 
 def _split_visible_notice(title: str, text: str) -> list[str]:
@@ -302,25 +401,38 @@ def capture_one(hwnd: int, title: str) -> ChatObservation:
     if not win32gui.IsWindowVisible(hwnd) or win32gui.IsIconic(hwnd):
         return ChatObservation(title, "", (), "창이 최소화되었거나 보이지 않습니다.")
     left, top = win32gui.ClientToScreen(hwnd, (0, 0))
-    x0, y0, x1, y1 = win32gui.GetClientRect(hwnd)
-    width, height = x1 - x0, y1 - y0
+    x0,y0,x1,y1 = win32gui.GetClientRect(hwnd)
+    width,height=x1-x0,y1-y0
     if width < MIN_WINDOW_WIDTH or height < MIN_WINDOW_HEIGHT:
         return ChatObservation(title, "", (), "채팅창이 너무 작습니다. 창을 넓혀 주세요.")
     if _foreground_obscures(hwnd, left, top, width, height):
         return ChatObservation(title, "", (), "다른 창이 채팅창을 가리고 있습니다. 창을 앞으로 꺼내 주세요.")
-    # mss reads visible pixels. Do not use PrintWindow, hooks, simulated keys.
     with mss.mss() as ctx:
-        monitor = ctx.monitors[0]
-        if not (monitor["left"] <= left and monitor["top"] <= top and
-                left + width <= monitor["left"] + monitor["width"] and
-                top + height <= monitor["top"] + monitor["height"]):
-            return ChatObservation(title, "", (), "화면 밖으로 나간 채팅창이 있습니다.")
-        shot = ctx.grab({"left": left, "top": top, "width": width, "height": height})
-        img = Image.frombytes("RGB", shot.size, shot.rgb)
-    text = image_to_text(img)
-    reservations = parse_ocr(title, text)
-    return ChatObservation(title, text, reservations,
-                           "읽을 수 있는 예약이 없습니다. 글씨 크기·창 가림 상태를 확인하세요." if not reservations else "")
+        if not _on_monitor(ctx.monitors[0],left,top,width,height):
+            return ChatObservation(title,"",(),"화면 밖으로 나간 채팅창이 있습니다.")
+        shot=ctx.grab({"left":left,"top":top,"width":width,"height":height})
+        image=Image.frombytes("RGB",shot.size,shot.rgb)
+    boxes=message_bubble_boxes(image)
+    chunks=[]
+    matches=[]
+    for box in boxes:
+        text=image_to_text(image.crop(box))
+        if not text:
+            continue
+        chunks.append(text)
+        # Never combine OCR from two different bubbles: one message must
+        # independently supply an intact booking ID/name/date/price/room.
+        matches.extend(parse_ocr(title,text))
+    unique={}
+    for reservation in matches:
+        unique[(reservation.number,reservation.cancelled)]=reservation
+    visible="\n\n----- 메시지 구분 -----\n\n".join(chunks)
+    if not boxes:
+        return ChatObservation(title,"",(),"흰색 예약 말풍선을 찾지 못했습니다. 채팅창/배율을 확인하세요.")
+    if not unique:
+        return ChatObservation(title,visible,(),
+            f"말풍선 {len(boxes)}개는 찾았지만 완전한 예약을 인식하지 못했습니다. OCR 글자를 확인하세요.")
+    return ChatObservation(title,visible,tuple(unique.values()))
 
 
 def scan_chats(selected_windows: dict[str, int] | None = None) -> list[ChatObservation]:
@@ -344,8 +456,9 @@ def scan_chats(selected_windows: dict[str, int] | None = None) -> list[ChatObser
             try:
                 header = _detect_chat_name(hwnd)
                 if header != title:
-                    observations.append(ChatObservation(title, "", (),
-                        "선택한 창에서 해당 채팅방의 이름을 OCR로 확인하지 못했습니다. 창 상단 이름이 보이는지 확인하세요."))
+                    preview=capture_one(hwnd,title)
+                    observations.append(ChatObservation(title, preview.visible_text, (),
+                        "채팅방 상단 이름을 OCR로 확인하지 못했습니다. 아래 내용은 진단 전용이며 자동 기록하지 않습니다."))
                 else:
                     observations.append(capture_one(hwnd, title))
             except Exception as exc:
