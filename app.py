@@ -10,7 +10,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from tkinter import filedialog, messagebox, scrolledtext, ttk
 from lan_receiver import NotificationReceiver, PORT, PATH, get_local_ip, new_token
-from pc_kakao_ocr import scan_chats, signature
+from pc_kakao_ocr import scan_chats, signature, enumerate_window_candidates, looks_like_kakao, CHAT_TITLES
 
 from excel_io import apply_reservation
 from reservations import parse_many, validate
@@ -60,7 +60,7 @@ def execute_one(path: str, reservation) -> list[str]:
 class App:
     def __init__(self, root: tk.Tk):
         self.root = root
-        self.root.title("향그린 예약 관리 · PC 카카오톡 자동감시 v3.1")
+        self.root.title("향그린 예약 관리 · PC 카카오톡 자동감시 v3.2")
         self.root.geometry("950x850")
         self.root.minsize(780, 720)
         self.settings = read_json(CONFIG)
@@ -80,6 +80,7 @@ class App:
         self.pc_processing = None
         self.pc_latest_count = 0
         self.pc_verified_preview = False
+        self.pc_selected_windows: dict[str, int] = {}
         self.pc_scan_error = ""
         self.bridge = None
         self.bridge_seen = set()
@@ -126,6 +127,7 @@ class App:
         ttk.Label(outer, text="3. PC 카카오톡 화면 자동감시 (NOL 알림 / 여기어때 독립 채팅창, 화면에 보여야 함)").pack(anchor="w")
         pc_row = ttk.Frame(outer); pc_row.pack(fill="x", pady=5)
         ttk.Button(pc_row, text="화면 읽기 테스트", command=self._pc_read_once).pack(side="left")
+        ttk.Button(pc_row, text="채팅창 직접 선택", command=self._pc_choose_windows).pack(side="left", padx=(6, 0))
         ttk.Checkbutton(pc_row, text="7초마다 감시", variable=self.pc_watch).pack(side="left", padx=(15, 6))
         ttk.Checkbutton(pc_row, text="자동 엑셀 기록 (검증 후 켜기)", variable=self.pc_write,
                         command=self._pc_toggle_write).pack(side="left", padx=6)
@@ -260,6 +262,76 @@ class App:
                 self.watch.set(False)
         self.root.after(10000, self._watch)
 
+    def _pc_choose_windows(self):
+        """Select visible chat windows explicitly when auto-discovery fails."""
+        if self.pc_scan_future is not None:
+            messagebox.showinfo("채팅창 선택", "현재 화면 읽기를 마친 다음 창을 선택해 주세요.")
+            return
+        try:
+            candidates = enumerate_window_candidates()
+        except Exception as exc:
+            messagebox.showerror("창 목록 오류", f"Windows 창 목록을 확인하지 못했습니다.\\n{exc}")
+            return
+        if not candidates:
+            messagebox.showwarning("창 없음", "보이는 창이 없습니다. 카카오톡 채팅창을 먼저 열어 주세요.")
+            return
+        candidates = sorted(candidates, key=lambda w: (not looks_like_kakao(w), w.left, w.top))
+        descriptions = [
+            f"{i + 1:02d} | {w.process[:25]} | 위치 {w.left},{w.top} | {w.width}x{w.height} | {(w.title or '제목 없음')[:35]}"
+            for i, w in enumerate(candidates)
+        ]
+        dialog = tk.Toplevel(self.root)
+        dialog.title("카카오톡 채팅창 지정 · v3.2")
+        dialog.geometry("930x245")
+        dialog.transient(self.root)
+        dialog.grab_set()
+        frame = ttk.Frame(dialog, padding=16)
+        frame.pack(fill="both", expand=True)
+        ttk.Label(frame, text="열려 있는 창에서 카카오톡의 NOL 알림과 여기어때 창을 각각 골라 주세요.").pack(anchor="w", pady=(0, 8))
+        ttk.Label(frame, text="카톡 창을 왼쪽·오른쪽에 두고, '위치'와 프로세스 이름으로 구분하세요. 다른 창은 선택하지 마세요.").pack(anchor="w", pady=(0, 12))
+        chosen = {}
+        for title in CHAT_TITLES:
+            row = ttk.Frame(frame)
+            row.pack(fill="x", pady=4)
+            ttk.Label(row, text=title, width=14).pack(side="left")
+            combo = ttk.Combobox(row, state="readonly", values=descriptions)
+            combo.pack(side="left", fill="x", expand=True)
+            for i, w in enumerate(candidates):
+                if self.pc_selected_windows.get(title) == w.hwnd:
+                    combo.current(i)
+                    break
+            chosen[title] = combo
+
+        def save_selection():
+            indexes = [c.current() for c in chosen.values()]
+            if any(i < 0 for i in indexes) or indexes[0] == indexes[1]:
+                messagebox.showwarning("창 선택", "NOL 알림과 여기어때를 서로 다른 창으로 지정해야 합니다.", parent=dialog)
+                return
+            self.pc_selected_windows = {title: candidates[chosen[title].current()].hwnd for title in CHAT_TITLES}
+            self.pc_verified_preview = False
+            self.pc_streak.clear()
+            self.pc_queue.clear()
+            self.pc_label.configure(text="창 직접 선택 완료 · 화면 읽기 테스트로 채팅방 이름을 검증하세요 · 자동기록 OFF")
+            self.pc_write.set(False)
+            self._log("카카오톡 채팅창 2개를 직접 지정했습니다. 화면 읽기 테스트로 확인하세요.")
+            dialog.destroy()
+
+        bottom = ttk.Frame(frame)
+        bottom.pack(fill="x", pady=(12, 0))
+        ttk.Button(bottom, text="선택 완료", command=save_selection).pack(side="left")
+        ttk.Button(bottom, text="자동 검색으로 되돌리기", command=lambda: self._pc_clear_selection(dialog)).pack(side="left", padx=10)
+        ttk.Button(bottom, text="닫기", command=dialog.destroy).pack(side="right")
+
+    def _pc_clear_selection(self, dialog):
+        self.pc_selected_windows.clear()
+        self.pc_verified_preview = False
+        self.pc_streak.clear()
+        self.pc_queue.clear()
+        self.pc_write.set(False)
+        self.pc_label.configure(text="자동 창 검색 모드 · 화면 읽기 테스트로 확인하세요")
+        self._log("카카오톡 창 직접 선택을 해제했습니다.")
+        dialog.destroy()
+
     def _pc_read_once(self):
         if self.pc_scan_future is not None:
             self._log("이미 OCR 화면 분석 중입니다.")
@@ -270,7 +342,7 @@ class App:
         self.root.after(700, self._pc_launch_manual_scan)
 
     def _pc_launch_manual_scan(self):
-        self.pc_scan_future = self.pc_pool.submit(scan_chats)
+        self.pc_scan_future = self.pc_pool.submit(scan_chats, dict(self.pc_selected_windows) or None)
 
     def _pc_toggle_write(self):
         if not self.pc_write.get():
@@ -332,7 +404,7 @@ class App:
                 if manual:
                     self.root.deiconify()  # Show only after local screenshot has finished.
         if self.pc_watch.get() and self.pc_scan_future is None:
-            self.pc_scan_future = self.pc_pool.submit(scan_chats)
+            self.pc_scan_future = self.pc_pool.submit(scan_chats, dict(self.pc_selected_windows) or None)
             self.pc_requested_manual_scan = False
         if self.pc_write.get() and self.pc_watch.get() and self.pc_queue and self.future is None:
             if self._valid_excel():
