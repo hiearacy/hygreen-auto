@@ -1,1 +1,5 @@
 pywin32>=306; sys_platform == "win32"
+psutil>=5.9
+Pillow>=10
+mss>=9
+pytesseract>=0.3.10
