@@ -9,6 +9,7 @@ import tkinter as tk
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from tkinter import filedialog, messagebox, scrolledtext, ttk
+from lan_receiver import NotificationReceiver, PORT, PATH, get_local_ip, new_token
 
 from excel_io import apply_reservation
 from reservations import parse_many, validate
@@ -16,6 +17,8 @@ from reservations import parse_many, validate
 APP_DIR = Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "HygreenAuto"
 CONFIG = APP_DIR / "settings.json"
 HISTORY = APP_DIR / "imported_files.json"
+LAN_INBOX = APP_DIR / "lan_inbox"
+REVIEW = APP_DIR / "review_needed"
 
 
 def read_json(path: Path) -> dict:
@@ -37,20 +40,33 @@ def execute(path: str, content: str) -> list[str]:
     failed = [(e.number, validate(e)) for e in events if validate(e)]
     if failed:
         raise ValueError("정보가 불완전한 예약이 있습니다: " + ", ".join(f"{n}({why})" for n, why in failed))
-    return [apply_reservation(path, e) for e in events]
+    results = []
+    for event in events:
+        result = apply_reservation(path, event)
+        if "취소 대상 예약번호 없음" in result:
+            raise ValueError(result + " · 알림을 확인 폴더에 보관합니다.")
+        results.append(result)
+    return results
 
 
 class App:
     def __init__(self, root: tk.Tk):
         self.root = root
         self.root.title("향그린 예약 관리 · 안전 모드")
-        self.root.geometry("840x690")
-        self.root.minsize(680, 560)
+        self.root.geometry("880x790")
+        self.root.minsize(700, 660)
         self.settings = read_json(CONFIG)
         self.history = read_json(HISTORY)
         self.excel = tk.StringVar(value=self.settings.get("excel", ""))
         self.folder = tk.StringVar(value=self.settings.get("folder", ""))
         self.watch = tk.BooleanVar(value=False)  # Never silently enable live writes at launch.
+        self.bridge_write = tk.BooleanVar(value=False)  # Explicit opt-in for unattended Excel edits.
+        self.bridge = None
+        self.bridge_seen = set()
+        self.bridge_token = self.settings.get("bridge_token") or new_token()
+        if not self.settings.get("bridge_token"):
+            self.settings["bridge_token"] = self.bridge_token
+            save_json(CONFIG, self.settings)
         self.pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="ExcelWriter")
         self.future = None
         self.work_file = None
@@ -58,6 +74,7 @@ class App:
         self._ui()
         self.root.after(400, self._poll)
         self.root.after(10000, self._watch)
+        self.root.after(2000, self._bridge_poll)
         self.root.protocol("WM_DELETE_WINDOW", self._close)
         self._log("준비 완료. 카카오톡 화면에는 접근하지 않습니다.")
 
@@ -71,7 +88,7 @@ class App:
         ttk.Entry(row, textvariable=self.excel).pack(side="left", fill="x", expand=True)
         ttk.Button(row, text="파일 선택", command=self._select_excel).pack(side="left", padx=(7, 0))
         ttk.Label(outer, text="1. 카카오톡 알림을 복사해 아래에 붙여넣으세요. 여러 건을 한꺼번에 넣어도 됩니다.").pack(anchor="w", pady=(15, 5))
-        self.text = scrolledtext.ScrolledText(outer, height=12, font=("맑은 고딕", 10), wrap="word")
+        self.text = scrolledtext.ScrolledText(outer, height=9, font=("맑은 고딕", 10), wrap="word")
         self.text.pack(fill="both", expand=True)
         buttons = ttk.Frame(outer); buttons.pack(fill="x", pady=8)
         ttk.Button(buttons, text="클립보드 붙여넣기", command=self._paste).pack(side="left")
@@ -84,9 +101,18 @@ class App:
         ttk.Entry(row, textvariable=self.folder).pack(side="left", fill="x", expand=True)
         ttk.Button(row, text="폴더 선택", command=self._select_folder).pack(side="left", padx=7)
         ttk.Checkbutton(row, text="자동 입력 켜기", variable=self.watch).pack(side="left")
+        ttk.Separator(outer, orient="horizontal").pack(fill="x", pady=(8, 7))
+        ttk.Label(outer, text="3. 휴대폰 알림 자동수신 (안드로이드 · 같은 Wi-Fi · 별도 MacroDroid 설정)").pack(anchor="w")
+        bridge_row = ttk.Frame(outer); bridge_row.pack(fill="x", pady=5)
+        self.bridge_button = ttk.Button(bridge_row, text="LAN 수신 시작", command=self._toggle_bridge)
+        self.bridge_button.pack(side="left")
+        ttk.Button(bridge_row, text="휴대폰 연결 정보 복사", command=self._copy_bridge).pack(side="left", padx=(8, 4))
+        ttk.Checkbutton(bridge_row, text="자동 엑셀 기록 (테스트 후 켜기)", variable=self.bridge_write).pack(side="left", padx=5)
+        self.bridge_label = ttk.Label(outer, text="수신 서버 꺼짐 · 자동 기록 꺼짐")
+        self.bridge_label.pack(anchor="w", pady=(0, 5))
         self.state = ttk.Label(outer, text="대기 중")
         self.state.pack(anchor="w", pady=5)
-        self.log = scrolledtext.ScrolledText(outer, height=9, state="disabled", font=("맑은 고딕", 9))
+        self.log = scrolledtext.ScrolledText(outer, height=7, state="disabled", font=("맑은 고딕", 9))
         self.log.pack(fill="both", expand=True)
 
     def _log(self, msg):
@@ -108,7 +134,7 @@ class App:
             self._save_settings()
 
     def _save_settings(self):
-        save_json(CONFIG, {"excel": self.excel.get(), "folder": self.folder.get()})
+        save_json(CONFIG, {"excel": self.excel.get(), "folder": self.folder.get(), "bridge_token": self.bridge_token})
 
     def _paste(self):
         try:
@@ -166,10 +192,15 @@ class App:
                 messages = self.future.result()
                 for m in messages: self._log(m)
                 self.state.configure(text=f"처리 완료 ({len(messages)}건)")
-                if self.work_file and self.work_hash:
+                if self.work_file and self.work_file.parent == LAN_INBOX:
+                    self.work_file.unlink(missing_ok=True)  # Delete processed private notification.
+                    self.bridge_seen.discard(str(self.work_file))
+                elif self.work_file and self.work_hash:
                     self.history[str(self.work_file)] = self.work_hash
                     save_json(HISTORY, self.history)
             except Exception as e:
+                if self.work_file and self.work_file.parent == LAN_INBOX:
+                    self._needs_review(self.work_file, "엑셀 처리 실패")
                 self._log("처리 중지: " + str(e))
                 self.state.configure(text="오류 발생 · 로그 확인")
             finally:
@@ -200,6 +231,76 @@ class App:
                 self._log("자동감시 폴더가 존재하지 않습니다.")
                 self.watch.set(False)
         self.root.after(10000, self._watch)
+        self.root.after(2000, self._bridge_poll)
+
+    def _toggle_bridge(self):
+        if self.bridge is not None:
+            self.bridge.stop()
+            self.bridge = None
+            self.bridge_write.set(False)
+            self.bridge_button.configure(text="LAN 수신 시작")
+            self.bridge_label.configure(text="수신 서버 꺼짐 · 자동 기록 꺼짐")
+            self._log("휴대폰 수신 서버를 종료했습니다.")
+            return
+        try:
+            bridge = NotificationReceiver(LAN_INBOX, self.bridge_token)
+            bridge.start()
+            self.bridge = bridge
+            self.bridge_button.configure(text="LAN 수신 중지")
+            self.bridge_label.configure(text=f"수신 대기: {get_local_ip()}:{PORT} · 자동 기록은 별도 선택")
+            self._log("휴대폰 알림 수신 준비 완료. 개인 Wi-Fi에서만 사용하세요.")
+        except OSError as e:
+            messagebox.showerror("수신 서버 시작 실패", f"포트 {PORT}을 열 수 없습니다.\n{e}")
+
+    def _copy_bridge(self):
+        if self.bridge is None:
+            messagebox.showwarning("수신 서버", "LAN 수신 시작을 먼저 누르세요.")
+            return
+        instructions = (f"URL: http://{get_local_ip()}:{PORT}{PATH}\n"
+                        "POST / Content-Type: text/plain; charset=utf-8\n"
+                        f"헤더 이름: X-Hygreen-Token\n헤더 값: {self.bridge_token}\n"
+                        "본문: {not_title} (줄바꿈) {notification} (줄바꿈) {not_text_big}")
+        self.root.clipboard_clear()
+        self.root.clipboard_append(instructions)
+        self._log("휴대폰 연동 정보(비밀키 포함)를 클립보드에 복사했습니다. 외부에 공유하지 마세요.")
+        messagebox.showinfo("연동 정보 복사 완료", "연동 정보가 클립보드에 복사됐습니다.\n메모장에 붙여넣어 MacroDroid에 입력하세요.\n인증키는 외부에 공유하지 마세요.")
+
+    def _needs_review(self, path: Path, reason: str):
+        REVIEW.mkdir(parents=True, exist_ok=True)
+        try:
+            target = REVIEW / path.name
+            path.replace(target)
+            self.bridge_seen.discard(str(path))
+            self._log(f"수동 확인 필요: {reason}. 보관 위치: {REVIEW}")
+        except OSError as e:
+            self._log(f"확인 필요 파일 이동 실패: {e}")
+            self.bridge_seen.add(str(path))
+
+    def _bridge_poll(self):
+        if self.bridge is not None:
+            for p in sorted(LAN_INBOX.glob("notice_*.txt")):
+                try:
+                    if time.time() - p.stat().st_mtime < 0.5: continue
+                    if not self.bridge_write.get():
+                        if str(p) not in self.bridge_seen:
+                            self.bridge_seen.add(str(p))
+                            self._log("카카오 알림 수신됨 · 자동 기록 OFF. 확인 후 체크박스를 켜세요.")
+                        continue
+                    if self.future is not None: break
+                    if not self._valid_excel(): break
+                    content = p.read_text(encoding="utf-8")
+                    events = parse_many(content)
+                    invalid = [e for e in events if validate(e)]
+                    if not events or invalid:
+                        why = ", ".join(validate(e) for e in invalid) if invalid else "예약 본문 인식 실패"
+                        self._needs_review(p, why)
+                        continue
+                    self._log(f"자동 수신 분석 성공: {len(events)}건 · 엑셀 기록 시작")
+                    self._submit(content, p, "queued")
+                    break
+                except (OSError, UnicodeError) as e:
+                    self._needs_review(p, f"읽기 실패: {e}")
+        self.root.after(2000, self._bridge_poll)
 
     def _close(self):
         self.watch.set(False)
@@ -207,6 +308,8 @@ class App:
         if self.future and not self.future.done():
             messagebox.showinfo("처리 중", "엑셀 작업이 진행 중입니다. 완료된 후 종료하세요.")
             return
+        if self.bridge is not None:
+            self.bridge.stop()
         self.pool.shutdown(wait=False, cancel_futures=True)
         self.root.destroy()
 
