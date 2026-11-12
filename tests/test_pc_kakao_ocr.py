@@ -1,7 +1,7 @@
 import unittest
 from unittest.mock import patch
 from pc_kakao_ocr import (parse_ocr, signature, classify_chat_header,
-                          WindowCandidate, looks_like_kakao, scan_chats, ChatObservation)
+                          WindowCandidate, looks_like_kakao, scan_chats, ChatObservation, message_bubble_boxes)
 from test_reservations import NOL, CANCEL, YEOGI
 
 class TestPCOCRParsing(unittest.TestCase):
@@ -48,6 +48,31 @@ class TestPCOCRParsing(unittest.TestCase):
             mismatch = scan_chats({"여기어때": 11, "NOL 알림": 9})
             self.assertEqual(len(mismatch), 2)
             self.assertTrue(all(not x.reservations and "확인하지 못했습니다" in x.warning for x in mismatch))
+
+    def test_separate_notification_bubbles_and_exclude_footer(self):
+        from PIL import Image, ImageDraw
+        image=Image.new("RGB",(380,610),(185,205,225))
+        draw=ImageDraw.Draw(image)
+        draw.rectangle((0,515,379,609),fill="white")
+        draw.rectangle((60,60,275,170),fill="white")
+        draw.rectangle((60,215,275,480),fill="white")
+        draw.rectangle((60,215,275,247),fill=(255,231,0))
+        boxes=message_bubble_boxes(image)
+        self.assertEqual(len(boxes),2)
+        self.assertTrue(boxes[0][1] <= 65 and boxes[0][3] >= 165)
+        self.assertTrue(boxes[1][1] <= 220 and boxes[1][3] >= 475)
+
+    def test_manual_header_failure_is_preview_only(self):
+        wins=[WindowCandidate(33,"","HostedKakao.exe","",0,0,380,610)]
+        fake=ChatObservation("NOL 알림","식별 실패 진단 문장",(parse_ocr("NOL 알림", NOL)[0],))
+        with patch("pc_kakao_ocr.check_ocr",return_value=""), \
+             patch("pc_kakao_ocr.enumerate_window_candidates",return_value=wins), \
+             patch("pc_kakao_ocr._detect_chat_name",return_value=None), \
+             patch("pc_kakao_ocr.capture_one",return_value=fake):
+            result=scan_chats({"NOL 알림":33})
+            self.assertEqual(result[0].visible_text,"식별 실패 진단 문장")
+            self.assertEqual(result[0].reservations,())
+            self.assertIn("진단 전용",result[0].warning)
 
     def test_stable_signature(self):
         a = parse_ocr("NOL 알림", NOL)[0]
