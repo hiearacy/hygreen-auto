@@ -1,4 +1,4 @@
-"""Safe reservation import UI. No synthetic keys, screen scraping or global hooks."""
+"""Hygreen desktop app. PC screen OCR is opt-in and read-only; no input injection."""
 from __future__ import annotations
 
 import hashlib
@@ -10,6 +10,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from tkinter import filedialog, messagebox, scrolledtext, ttk
 from lan_receiver import NotificationReceiver, PORT, PATH, get_local_ip, new_token
+from pc_kakao_ocr import scan_chats, signature
 
 from excel_io import apply_reservation
 from reservations import parse_many, validate
@@ -49,18 +50,37 @@ def execute(path: str, content: str) -> list[str]:
     return results
 
 
+def execute_one(path: str, reservation) -> list[str]:
+    problem = validate(reservation)
+    if problem:
+        raise ValueError(f"OCR 데이터 확인 필요: {problem}")
+    return [apply_reservation(path, reservation)]
+
+
 class App:
     def __init__(self, root: tk.Tk):
         self.root = root
-        self.root.title("향그린 예약 관리 · 안전 모드")
-        self.root.geometry("880x790")
-        self.root.minsize(700, 660)
+        self.root.title("향그린 예약 관리 · PC 카카오톡 자동감시 v3")
+        self.root.geometry("950x850")
+        self.root.minsize(780, 720)
         self.settings = read_json(CONFIG)
         self.history = read_json(HISTORY)
         self.excel = tk.StringVar(value=self.settings.get("excel", ""))
         self.folder = tk.StringVar(value=self.settings.get("folder", ""))
         self.watch = tk.BooleanVar(value=False)  # Never silently enable live writes at launch.
-        self.bridge_write = tk.BooleanVar(value=False)  # Explicit opt-in for unattended Excel edits.
+        self.bridge_write = tk.BooleanVar(value=False)  # Legacy LAN mode, not used in PC OCR.
+        self.pc_watch = tk.BooleanVar(value=False)  # Explicit opt-in per run.
+        self.pc_write = tk.BooleanVar(value=False)  # Explicit opt-in per run.
+        self.pc_scan_future = None
+        self.pc_requested_manual_scan = False
+        self.pc_streak: dict[tuple, int] = {}
+        self.pc_finished: set[tuple] = set()
+        self.pc_failed: set[tuple] = set()
+        self.pc_queue = []
+        self.pc_processing = None
+        self.pc_latest_count = 0
+        self.pc_verified_preview = False
+        self.pc_scan_error = ""
         self.bridge = None
         self.bridge_seen = set()
         self.bridge_token = self.settings.get("bridge_token") or new_token()
@@ -68,15 +88,16 @@ class App:
             self.settings["bridge_token"] = self.bridge_token
             save_json(CONFIG, self.settings)
         self.pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="ExcelWriter")
+        self.pc_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="KakaoOCR")
         self.future = None
         self.work_file = None
         self.work_hash = None
         self._ui()
         self.root.after(400, self._poll)
         self.root.after(10000, self._watch)
-        self.root.after(2000, self._bridge_poll)
+        self.root.after(1000, self._pc_poll)
         self.root.protocol("WM_DELETE_WINDOW", self._close)
-        self._log("준비 완료. 카카오톡 화면에는 접근하지 않습니다.")
+        self._log("준비 완료. PC 카카오톡 화면 읽기는 사용자가 켜야 작동합니다. 창을 가리지 마세요.")
 
     def _ui(self):
         outer = ttk.Frame(self.root, padding=16)
@@ -102,14 +123,15 @@ class App:
         ttk.Button(row, text="폴더 선택", command=self._select_folder).pack(side="left", padx=7)
         ttk.Checkbutton(row, text="자동 입력 켜기", variable=self.watch).pack(side="left")
         ttk.Separator(outer, orient="horizontal").pack(fill="x", pady=(8, 7))
-        ttk.Label(outer, text="3. 휴대폰 알림 자동수신 (안드로이드 · 같은 Wi-Fi · 별도 MacroDroid 설정)").pack(anchor="w")
-        bridge_row = ttk.Frame(outer); bridge_row.pack(fill="x", pady=5)
-        self.bridge_button = ttk.Button(bridge_row, text="LAN 수신 시작", command=self._toggle_bridge)
-        self.bridge_button.pack(side="left")
-        ttk.Button(bridge_row, text="휴대폰 연결 정보 복사", command=self._copy_bridge).pack(side="left", padx=(8, 4))
-        ttk.Checkbutton(bridge_row, text="자동 엑셀 기록 (테스트 후 켜기)", variable=self.bridge_write).pack(side="left", padx=5)
-        self.bridge_label = ttk.Label(outer, text="수신 서버 꺼짐 · 자동 기록 꺼짐")
-        self.bridge_label.pack(anchor="w", pady=(0, 5))
+        ttk.Label(outer, text="3. PC 카카오톡 화면 자동감시 (NOL 알림 / 여기어때 독립 채팅창, 화면에 보여야 함)").pack(anchor="w")
+        pc_row = ttk.Frame(outer); pc_row.pack(fill="x", pady=5)
+        ttk.Button(pc_row, text="화면 읽기 테스트", command=self._pc_read_once).pack(side="left")
+        ttk.Checkbutton(pc_row, text="7초마다 감시", variable=self.pc_watch).pack(side="left", padx=(15, 6))
+        ttk.Checkbutton(pc_row, text="자동 엑셀 기록 (검증 후 켜기)", variable=self.pc_write,
+                        command=self._pc_toggle_write).pack(side="left", padx=6)
+        self.pc_label = ttk.Label(outer, text="기본 OFF · 캡처 이미지 저장 안 함 · 카카오톡 클릭/키보드 조작 없음")
+        self.pc_label.pack(anchor="w", pady=(0, 5))
+        ttk.Label(outer, text="주의: 다른 창이 카톡을 가리거나 화면이 잠기면 감지가 불가능합니다. OCR 오인식 방지를 위해 2회 재확인 후 입력합니다.", foreground="#914500").pack(anchor="w")
         self.state = ttk.Label(outer, text="대기 중")
         self.state.pack(anchor="w", pady=5)
         self.log = scrolledtext.ScrolledText(outer, height=7, state="disabled", font=("맑은 고딕", 9))
@@ -190,6 +212,8 @@ class App:
         if self.future is not None and self.future.done():
             try:
                 messages = self.future.result()
+                if self.pc_processing is not None:
+                    self.pc_finished.add(self.pc_processing)
                 for m in messages: self._log(m)
                 self.state.configure(text=f"처리 완료 ({len(messages)}건)")
                 if self.work_file and self.work_file.parent == LAN_INBOX:
@@ -199,6 +223,9 @@ class App:
                     self.history[str(self.work_file)] = self.work_hash
                     save_json(HISTORY, self.history)
             except Exception as e:
+                if self.pc_processing is not None:
+                    self.pc_failed.add(self.pc_processing)
+                    self._log("PC OCR 기록 실패 · 안전을 위해 자동 재시도하지 않습니다.")
                 if self.work_file and self.work_file.parent == LAN_INBOX:
                     self._needs_review(self.work_file, "엑셀 처리 실패")
                 self._log("처리 중지: " + str(e))
@@ -207,6 +234,7 @@ class App:
                 self.future = None
                 self.work_file = None
                 self.work_hash = None
+                self.pc_processing = None
         self.root.after(400, self._poll)
 
     def _watch(self):
@@ -231,7 +259,91 @@ class App:
                 self._log("자동감시 폴더가 존재하지 않습니다.")
                 self.watch.set(False)
         self.root.after(10000, self._watch)
-        self.root.after(2000, self._bridge_poll)
+
+    def _pc_read_once(self):
+        if self.pc_scan_future is not None:
+            self._log("이미 OCR 화면 분석 중입니다.")
+            return
+        self.pc_requested_manual_scan = True
+        self.pc_label.configure(text="화면 읽기 진행 중 · 프로그램 화면을 잠깐 숨깁니다.")
+        self.root.withdraw()  # Hide *our own* window to avoid obscuring the chat screenshots.
+        self.root.after(700, self._pc_launch_manual_scan)
+
+    def _pc_launch_manual_scan(self):
+        self.pc_scan_future = self.pc_pool.submit(scan_chats)
+
+    def _pc_toggle_write(self):
+        if not self.pc_write.get():
+            return
+        if not self.pc_verified_preview:
+            messagebox.showwarning("화면 읽기 테스트 먼저", "먼저 화면 읽기 테스트에서 실제 예약이 정확하게 인식되는지 확인하세요.")
+            self.pc_write.set(False)
+            return
+        if not messagebox.askyesno("실제 엑셀 자동 기록", "정말 자동 기록을 켤까요?\nOCR은 잘못 인식할 수 있으므로 테스트용 엑셀로 여러 건 검증한 후 켜세요."):
+            self.pc_write.set(False)
+
+    def _pc_poll(self):
+        if self.pc_scan_future is not None and self.pc_scan_future.done():
+            manual = self.pc_requested_manual_scan
+            self.pc_requested_manual_scan = False
+            try:
+                observations = self.pc_scan_future.result()
+                issues = [o for o in observations if o.warning]
+                seen = {}
+                for item in observations:
+                    for res in item.reservations:
+                        seen[signature(res)] = res
+                self.pc_streak = {k: min(self.pc_streak.get(k, 0) + 1, 1000) for k in seen}
+                self.pc_latest_count = len(seen)
+                names = ", ".join(o.title for o in observations)
+                self.pc_label.configure(text=f"연결: {names} · 검증된 예약 {len(seen)}건 · 자동 기록 {'ON' if self.pc_write.get() else 'OFF'}")
+                if manual:
+                    self.pc_verified_preview = bool(seen)
+                    blocks = [f"[{o.title}] OCR 결과 (직접 검토 필요)\n{o.visible_text}" for o in observations]
+                    self.text.delete("1.0", "end")
+                    self.text.insert("1.0", "\n\n--------\n\n".join(blocks))
+                    self._log(f"화면 읽기 테스트: 카카오톡 {len(observations)}개 창 / 예약 {len(seen)}건")
+                    for o in issues:
+                        self._log(f"{o.title}: {o.warning}")
+                    for res in seen.values():
+                        self._log(f"OCR: {res.source} / {res.number} / {res.check_in} / {res.amount:,}원")
+                if self.pc_watch.get() and self.pc_write.get():
+                    for key, res in seen.items():
+                        needed = 3 if res.cancelled else 2
+                        if self.pc_streak[key] < needed:
+                            continue
+                        if key in self.pc_finished or key in self.pc_failed:
+                            continue
+                        if key == self.pc_processing or any(signature(x) == key for x in self.pc_queue):
+                            continue
+                        self.pc_queue.append(res)
+                self.pc_scan_error = ""
+            except Exception as exc:
+                msg = str(exc)
+                if manual or msg != self.pc_scan_error:
+                    self._log("PC 화면 감시: " + msg)
+                self.pc_scan_error = msg
+                self.pc_label.configure(text="화면 읽기 실패 · 로그와 OCR 설치 상태 확인")
+                # Incomplete OCR dependencies should not spam background processes.
+                if "설치" in msg or "언어팩" in msg or "Windows" in msg:
+                    self.pc_watch.set(False)
+            finally:
+                self.pc_scan_future = None
+                if manual:
+                    self.root.deiconify()  # Show only after local screenshot has finished.
+        if self.pc_watch.get() and self.pc_scan_future is None:
+            self.pc_scan_future = self.pc_pool.submit(scan_chats)
+            self.pc_requested_manual_scan = False
+        if self.pc_write.get() and self.pc_watch.get() and self.pc_queue and self.future is None:
+            if self._valid_excel():
+                res = self.pc_queue.pop(0)
+                self.pc_processing = signature(res)
+                self.future = self.pool.submit(execute_one, self.excel.get(), res)
+                self.state.configure(text="PC 예약 자동 엑셀 기록 중…")
+            else:
+                self.pc_write.set(False)
+                self._log("엑셀 선택 오류로 PC 자동 기록이 중단됐습니다.")
+        self.root.after(7000, self._pc_poll)
 
     def _toggle_bridge(self):
         if self.bridge is not None:
@@ -304,6 +416,8 @@ class App:
 
     def _close(self):
         self.watch.set(False)
+        self.pc_watch.set(False)
+        self.pc_write.set(False)
         self._save_settings()
         if self.future and not self.future.done():
             messagebox.showinfo("처리 중", "엑셀 작업이 진행 중입니다. 완료된 후 종료하세요.")
@@ -311,10 +425,16 @@ class App:
         if self.bridge is not None:
             self.bridge.stop()
         self.pool.shutdown(wait=False, cancel_futures=True)
+        self.pc_pool.shutdown(wait=False, cancel_futures=True)
         self.root.destroy()
 
 
 if __name__ == "__main__":
+    if os.name == "nt":
+        # Make GetClientRect/ClientToScreen coordinates match mss physical pixels.
+        import ctypes
+        try: ctypes.windll.shcore.SetProcessDpiAwareness(2)
+        except (AttributeError, OSError): pass
     root = tk.Tk()
     App(root)
     root.mainloop()
