@@ -53,6 +53,11 @@ class TestParsing(unittest.TestCase):
         pasted = '[NOL 알림] [오전 9:47] ' + NOL + '\n[NOL 알림] [오전 9:48] ' + CANCEL + '\n[NOL 알림] [오전 9:49] ' + NOL
         events = parse_many(pasted)
         self.assertEqual(len(events), 2)
+    def test_exact_ocr_variant_of_fluffy_room(self):
+        from reservations import _room
+        self.assertEqual(_room("폭신한방-도보전용"), "푹신한방")
+        self.assertEqual(_room("알수없는 객실"), "")
+
     def test_unknown_room_blocks_write(self):
         r = parse_one(NOL.replace("푹신한방", "미지의객실"))
         self.assertIn("객실타입", validate(r))
