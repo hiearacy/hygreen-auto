@@ -52,3 +52,7 @@ Windows PC에서 **NOL 알림(야놀자·아고다 등)과 여기어때** 예약
 ```powershell
 python -m unittest discover -s tests -v
 ```
+
+## Python 설치 없이 Windows에서 실행하기 (EXE)
+
+GitHub의 **Actions → Build Windows EXE**에서 `Run workflow`를 실행하고 빌드가 성공하면 해당 실행 페이지의 **Artifacts → HygreenAuto-Windows**를 다운로드하여 압축을 해제한 뒤 `HygreenAuto.exe`를 실행할 수 있습니다. **빌드 성공 여부와 실제 Windows 작동은 별도 확인이 필요합니다.** EXE 파일에도 Microsoft Excel 데스크톱 앱은 필요합니다.
