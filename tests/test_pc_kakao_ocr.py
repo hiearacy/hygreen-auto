@@ -17,6 +17,24 @@ class TestPCOCRParsing(unittest.TestCase):
         reservations = parse_ocr("NOL 알림", CANCEL)
         self.assertEqual(len(reservations), 1)
         self.assertTrue(reservations[0].cancelled)
+    def test_nol_cancel_missing_closing_bracket(self):
+        text = CANCEL.replace("<숙박 취소>", "<숙박 취소")
+        result = parse_ocr("NOL 알림", text)
+        self.assertEqual(result, parse_ocr("NOL 알림", CANCEL))
+        self.assertTrue(result[0].cancelled)
+
+    def test_recovered_cancel_requires_complete_body(self):
+        text = CANCEL.replace("<숙박 취소>", "<숙박 취소")
+        for broken in (text.replace("40,000원", "40,OOO원"),
+                       text.replace("050700000000", ""),
+                       text.replace("NOL 미리예약", "NOL 알림"),
+                       text.replace("2699990000000002", "26999900000000")):
+            self.assertEqual(parse_ocr("NOL 알림", broken), ())
+
+    def test_unknown_or_partial_status_not_repaired(self):
+        for marker in ("<숙박", "<숙박 취", "<숙박 취수", "<숙박 취소?", "<숙박 취소\n<숙박>"):
+            self.assertEqual(parse_ocr("NOL 알림", CANCEL.replace("<숙박 취소>", marker)), ())
+
     def test_wrong_sender_disallowed(self):
         self.assertEqual(parse_ocr("친구 단톡", NOL), ())
         self.assertEqual(parse_ocr("여기어때", NOL), ())
