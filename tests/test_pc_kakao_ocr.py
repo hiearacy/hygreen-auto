@@ -74,6 +74,23 @@ class TestPCOCRParsing(unittest.TestCase):
             self.assertEqual(result[0].reservations,())
             self.assertIn("진단 전용",result[0].warning)
 
+    def test_header_crop_includes_scaled_name_and_excludes_body(self):
+        from PIL import Image, ImageDraw
+        from pc_kakao_ocr import header_crop
+        for width in (300, 380, 500):
+            image = Image.new("RGB", (width, 650), (185, 205, 225))
+            draw = ImageDraw.Draw(image)
+            body_top = round(width * .23)
+            draw.rectangle((round(width * .16), body_top, round(width * .74), 400), fill="white")
+            crop = header_crop(image)
+            self.assertGreater(crop.height, round(width * .16))
+            self.assertEqual(crop.height, body_top)
+
+    def test_signature_includes_contact(self):
+        from dataclasses import replace
+        r = parse_ocr("NOL 알림", NOL)[0]
+        self.assertNotEqual(signature(r), signature(replace(r, phone="050000000000")))
+
     def test_stable_signature(self):
         a = parse_ocr("NOL 알림", NOL)[0]
         b = parse_ocr("NOL 알림", NOL)[0]
