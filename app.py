@@ -60,7 +60,7 @@ def execute_one(path: str, reservation) -> list[str]:
 class App:
     def __init__(self, root: tk.Tk):
         self.root = root
-        self.root.title("향그린 예약 관리 · PC 카카오톡 자동감시 v3.4")
+        self.root.title("향그린 예약 관리 · PC 카카오톡 자동감시 v3.5")
         self.root.geometry("950x850")
         self.root.minsize(780, 720)
         self.settings = read_json(CONFIG)
@@ -281,7 +281,7 @@ class App:
             for i, w in enumerate(candidates)
         ]
         dialog = tk.Toplevel(self.root)
-        dialog.title("카카오톡 채팅창 지정 · v3.4")
+        dialog.title("카카오톡 채팅창 지정 · v3.5")
         dialog.geometry("930x245")
         dialog.transient(self.root)
         dialog.grab_set()
@@ -378,7 +378,7 @@ class App:
                     for o in issues:
                         self._log(f"{o.title}: {o.warning}")
                     for res in seen.values():
-                        self._log(f"OCR: {res.source} / {res.number} / {res.check_in} / {res.amount:,}원")
+                        self._log(f"OCR: {res.source} / {res.number} / {res.check_in} / {res.amount:,}원 / {'예약취소' if res.cancelled else '신규예약'}")
                 if self.pc_watch.get() and self.pc_write.get():
                     for key, res in seen.items():
                         needed = 3 if res.cancelled else 2
