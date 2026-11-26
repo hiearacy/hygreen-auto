@@ -73,7 +73,7 @@ def execute_one(path: str, reservation) -> list[str]:
 class App:
     def __init__(self, root: tk.Tk):
         self.root = root
-        self.root.title("향그린 예약 관리 · PC 카카오톡 자동감시 v3.6")
+        self.root.title("향그린 예약 관리 · PC 카카오톡 자동감시 v3.7")
         self.root.geometry("950x850")
         self.root.minsize(780, 720)
         self.settings = read_json(CONFIG)
@@ -345,7 +345,7 @@ class App:
             for i, w in enumerate(candidates)
         ]
         dialog = tk.Toplevel(self.root)
-        dialog.title("카카오톡 채팅창 지정 · v3.6")
+        dialog.title("카카오톡 채팅창 지정 · v3.7")
         dialog.geometry("930x245")
         dialog.transient(self.root)
         dialog.grab_set()
