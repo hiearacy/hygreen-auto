@@ -111,12 +111,38 @@ def classify_chat_header(text: str) -> str | None:
     return "여기어때" if yeogi else "NOL 알림"
 
 
+def header_crop(image):
+    """Scale header to the actual window size; stop before the first notice."""
+    img = image.convert("RGB")
+    w, h = img.size
+    start = max(1, round(w * .12))
+    end = min(h, round(w * .29), 170)
+    # The actual header occupies ~87 px at 380px width; old 45px crop
+    # omitted the room name on a normal Windows title-bar layout.
+    bottom = next((y for y in range(start, end)
+                   if _bubble_row_active(img.load(), w, y)),
+                  min(end, round(w * .24)))
+    return img.crop((round(w * .15), 0, round(w * .67), bottom))
+
+
+def read_header(image) -> str | None:
+    """Identify the room from the header only, never the message body."""
+    from PIL import Image, ImageOps
+    import pytesseract
+    crop = header_crop(image)
+    if crop.height < 15 or crop.width < 50:
+        return None
+    gray = ImageOps.autocontrast(ImageOps.grayscale(crop.resize(
+        (crop.width * 4, crop.height * 4), Image.Resampling.LANCZOS)))
+    text = pytesseract.image_to_string(gray, lang="kor+eng", config="--psm 6", timeout=15)
+    return classify_chat_header(text)
+
+
 def _detect_chat_name(hwnd: int) -> str | None:
-    """Read KakaoTalk's small title region rather than the mixed header + notices."""
+    """Read a bounded, size-adaptive region of the visible chat header."""
     import mss
     import win32gui
-    from PIL import Image, ImageEnhance, ImageOps
-    import pytesseract
+    from PIL import Image
 
     left, top = win32gui.ClientToScreen(hwnd, (0, 0))
     rect = win32gui.GetClientRect(hwnd)
@@ -125,23 +151,13 @@ def _detect_chat_name(hwnd: int) -> str | None:
         return None
     if _foreground_obscures(hwnd, left, top, width, height):
         return None
-    # Header text begins roughly 45 px from the client's left edge. Keep the
-    # screenshot strictly within this window and exclude the first chat bubble.
-    x = min(40, max(0, width - 150))
-    h = min(45, height)
-    cw = min(width - x, 260)
+    h = min(height, round(width * .29), 170)
     with mss.mss() as ctx:
-        monitor = ctx.monitors[0]
-        if not _on_monitor(monitor, left + x, top, cw, h):
+        if not _on_monitor(ctx.monitors[0], left, top, width, h):
             return None
-        shot = ctx.grab({"left": left + x, "top": top,
-                         "width": cw, "height": h})
-        header = Image.frombytes("RGB", shot.size, shot.rgb)
-    enlarged = header.resize((cw * 4, h * 4), Image.Resampling.LANCZOS)
-    gray = ImageOps.autocontrast(ImageOps.grayscale(enlarged))
-    gray = ImageEnhance.Contrast(gray).enhance(1.6)
-    header_text = pytesseract.image_to_string(gray, lang="kor+eng", config="--psm 6")
-    return classify_chat_header(header_text)
+        shot = ctx.grab({"left": left, "top": top, "width": width, "height": h})
+        image = Image.frombytes("RGB", shot.size, shot.rgb)
+    return read_header(image)
 
 
 def _on_monitor(monitor: dict, left: int, top: int, width: int, height: int) -> bool:
@@ -194,7 +210,7 @@ def image_to_text(img) -> str:
     image = image.resize((w * 4, h * 4), Image.Resampling.LANCZOS)
     # Uniform text lines are much more reliable with PSM 6 than PSM 11 when
     # Korean, amounts, dates and phone numbers share one narrow bubble.
-    return pytesseract.image_to_string(image, lang="kor+eng", config="--psm 6").strip()
+    return pytesseract.image_to_string(image, lang="kor+eng", config="--psm 6", timeout=20).strip()
 
 
 def _bubble_row_active(pixels, width: int, y: int) -> bool:
@@ -495,4 +511,4 @@ def scan_chats(selected_windows: dict[str, int] | None = None) -> list[ChatObser
 
 
 def signature(r: Reservation) -> tuple:
-    return (r.channel, r.number, r.cancelled, r.guest, r.check_in, r.room, r.amount, r.vehicle)
+    return (r.channel, r.number, r.cancelled, r.guest, r.check_in, r.room, r.amount, r.vehicle, r.phone)
