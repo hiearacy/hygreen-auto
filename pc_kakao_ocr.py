@@ -349,15 +349,52 @@ def _split_visible_notice(title: str, text: str) -> list[str]:
     return blocks
 
 
+def _recover_nol_cancel_marker(block: str) -> tuple[str, bool]:
+    """Recover only a missing closing bracket on an explicit NOL cancellation.
+
+    Do not infer cancellation from a partial or misspelled word, or recover a
+    normal booking marker that may actually have a clipped cancellation suffix.
+    Require a single known-format ID and a clear reservation heading before
+    repairing. The caller must also validate the recovered cancellation body.
+    """
+    lines = block.splitlines()
+    markers = [i for i, line in enumerate(lines)
+               if re.fullmatch(r"\s*<\s*숙박\s*취소\s*", line)]
+    if len(markers) != 1:
+        return block, False
+    i = markers[0]
+    if i == 0 or i > 5 or not re.fullmatch(r"\s*NOL\s*[^\n]*예약\s*", lines[i-1]):
+        return block, False
+    ids = [line.strip() for line in lines[i+1:] if re.fullmatch(r"\s*\d{16}\s*", line)]
+    if len(ids) != 1 or any(re.search(r"[<〈]\s*숙박", line) for j, line in enumerate(lines) if j != i):
+        return block, False
+    lines[i] = "<숙박 취소>"
+    return "\n".join(lines), True
+
+
 def parse_ocr(title: str, text: str) -> tuple[Reservation, ...]:
     if title not in CHAT_TITLES:
         return ()
     result = []
     seen = set()
     for block in _split_visible_notice(title, text):
+        recovered = False
+        if title == "NOL 알림":
+            block, recovered = _recover_nol_cancel_marker(block)
+            statuses = [line.strip() for line in block.splitlines() if re.match(r"\s*[<〈]\s*숙박", line)]
+            if len(statuses) != 1 or statuses[0] not in ("<숙박>", "<숙박 취소>"):
+                continue
         parsed = parse_one(block)
         if parsed is None or validate(parsed):
             continue
+        if recovered:
+            # Manual cancellation needs only ID; a repaired OCR marker must
+            # have complete supporting details before it may enter the queue.
+            from dataclasses import replace
+            if (not parsed.cancelled or validate(replace(parsed, cancelled=False))
+                    or not re.fullmatch(r"\+?\d{9,15}", parsed.phone)
+                    or parsed.vehicle not in (0, 1)):
+                continue
         if title == "여기어때" and parsed.channel != "여기":
             continue
         if title == "NOL 알림" and parsed.channel != "야놀자":
