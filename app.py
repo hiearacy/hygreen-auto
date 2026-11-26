@@ -50,6 +50,19 @@ def execute(path: str, content: str) -> list[str]:
     return results
 
 
+def execute_ocr_batch(path: str, events) -> list[str]:
+    """Write the exact validated OCR snapshot, not its diagnostic text."""
+    events = tuple(events)
+    if not events:
+        raise ValueError("검증된 OCR 예약이 없습니다. 화면 읽기 테스트를 다시 실행하세요.")
+    for event in events:
+        problem = validate(event)
+        if problem:
+            raise ValueError(f"{event.number}: {problem}")
+    # Keep individual results, including cancellations that need manual review.
+    return [apply_reservation(path, event) for event in events]
+
+
 def execute_one(path: str, reservation) -> list[str]:
     problem = validate(reservation)
     if problem:
@@ -60,7 +73,7 @@ def execute_one(path: str, reservation) -> list[str]:
 class App:
     def __init__(self, root: tk.Tk):
         self.root = root
-        self.root.title("향그린 예약 관리 · PC 카카오톡 자동감시 v3.5")
+        self.root.title("향그린 예약 관리 · PC 카카오톡 자동감시 v3.6")
         self.root.geometry("950x850")
         self.root.minsize(780, 720)
         self.settings = read_json(CONFIG)
@@ -80,6 +93,8 @@ class App:
         self.pc_processing = None
         self.pc_latest_count = 0
         self.pc_verified_preview = False
+        self.pc_preview_events = None  # None = pasted text; tuple = OCR snapshot (possibly empty).
+        self.pc_preview_text = ""
         self.pc_selected_windows: dict[str, int] = {}
         self.pc_scan_error = ""
         self.bridge = None
@@ -162,8 +177,11 @@ class App:
 
     def _paste(self):
         try:
+            content = self.root.clipboard_get()
+            self.pc_preview_events = None
+            self.pc_preview_text = ""
             self.text.delete("1.0", "end")
-            self.text.insert("1.0", self.root.clipboard_get())
+            self.text.insert("1.0", content)
             self._preview()
         except tk.TclError:
             messagebox.showwarning("클립보드", "복사된 텍스트가 없습니다.")
@@ -173,12 +191,29 @@ class App:
         if p:
             try: content = Path(p).read_text(encoding="utf-8-sig")
             except UnicodeError: content = Path(p).read_text(encoding="cp949")
+            self.pc_preview_events = None
+            self.pc_preview_text = ""
             self.text.delete("1.0", "end")
             self.text.insert("1.0", content)
             self._preview()
 
+    def _displayed_events(self):
+        content = self.text.get("1.0", "end")
+        if self.pc_preview_events is not None:
+            if content != self.pc_preview_text:
+                raise ValueError("OCR 결과가 수정되었습니다. 화면 읽기 테스트를 다시 하거나 클립보드 붙여넣기로 원문을 입력하세요.")
+            return self.pc_preview_events
+        if "OCR 결과 (직접 검토 필요)" in content:
+            raise ValueError("OCR 진단 텍스트는 직접 기록하지 않습니다. 화면 읽기 테스트를 다시 실행하세요.")
+        return parse_many(content)
+
     def _preview(self):
-        events = parse_many(self.text.get("1.0", "end"))
+        try:
+            events = self._displayed_events()
+        except ValueError as exc:
+            self.state.configure(text=str(exc))
+            self._log(str(exc))
+            return
         if not events:
             self.state.configure(text="예약이 인식되지 않았습니다.")
             return
@@ -189,14 +224,33 @@ class App:
 
     def _manual(self):
         if not self._valid_excel(): return
-        content = self.text.get("1.0", "end")
-        events = parse_many(content)
+        if self.future is not None:
+            messagebox.showinfo("기록 중", "현재 엑셀 기록이 끝난 뒤 다시 눌러주세요.")
+            return
+        if self.pc_requested_manual_scan:
+            messagebox.showinfo("분석 중", "화면 읽기 테스트가 끝난 뒤 다시 눌러주세요.")
+            return
+        try:
+            events = tuple(self._displayed_events())
+        except ValueError as exc:
+            messagebox.showwarning("예약 확인", str(exc))
+            return
         if not events:
-            messagebox.showwarning("예약 없음", "붙여넣은 내용에서 예약을 인식하지 못했습니다.")
+            messagebox.showwarning("예약 없음", "기록할 검증된 예약이 없습니다. 화면 읽기 테스트 또는 원문 붙여넣기를 다시 해주세요.")
             return
-        if not messagebox.askyesno("엑셀 입력 확인", f"{len(events)}건을 엑셀에 반영할까요?\n작업 전 자동 백업합니다."):
+        content = self.text.get("1.0", "end")
+        is_ocr = self.pc_preview_events is not None
+        target = self.excel.get()
+        new_count = sum(not e.cancelled for e in events)
+        cancel_count = sum(e.cancelled for e in events)
+        if not messagebox.askyesno("엑셀 입력 확인", f"{len(events)}건을 엑셀에 반영할까요?\n신규 {new_count}건 / 취소 {cancel_count}건\n작업 전 자동 백업합니다."):
             return
-        self._submit(content)
+        if is_ocr:
+            self.work_file = self.work_hash = None
+            self.future = self.pool.submit(execute_ocr_batch, target, events)
+            self.state.configure(text="검증된 OCR 예약 기록 중…")
+        else:
+            self._submit(content)
 
     def _valid_excel(self) -> bool:
         if not Path(self.excel.get()).is_file():
@@ -214,10 +268,17 @@ class App:
         if self.future is not None and self.future.done():
             try:
                 messages = self.future.result()
+                missing = sum("취소 대상 예약번호 없음" in m for m in messages)
                 if self.pc_processing is not None:
-                    self.pc_finished.add(self.pc_processing)
+                    if missing:
+                        self.pc_failed.add(self.pc_processing)
+                    else:
+                        self.pc_finished.add(self.pc_processing)
                 for m in messages: self._log(m)
-                self.state.configure(text=f"처리 완료 ({len(messages)}건)")
+                if missing:
+                    self.state.configure(text=f"처리 결과 {len(messages)}건 · 취소 대상 없음 {missing}건 (수동 확인)")
+                else:
+                    self.state.configure(text=f"처리 완료 ({len(messages)}건)")
                 if self.work_file and self.work_file.parent == LAN_INBOX:
                     self.work_file.unlink(missing_ok=True)  # Delete processed private notification.
                     self.bridge_seen.discard(str(self.work_file))
@@ -263,25 +324,28 @@ class App:
         self.root.after(10000, self._watch)
 
     def _pc_choose_windows(self):
-        """Select visible chat windows explicitly when auto-discovery fails."""
+        """Explicitly select two visible chat HWNDs when automatic detection fails."""
         if self.pc_scan_future is not None:
             messagebox.showinfo("채팅창 선택", "현재 화면 읽기를 마친 다음 창을 선택해 주세요.")
             return
         try:
             candidates = enumerate_window_candidates()
         except Exception as exc:
-            messagebox.showerror("창 목록 오류", f"Windows 창 목록을 확인하지 못했습니다.\\n{exc}")
+            messagebox.showerror("창 목록 오류", f"Windows 창 목록을 확인하지 못했습니다.\n{exc}")
             return
         if not candidates:
             messagebox.showwarning("창 없음", "보이는 창이 없습니다. 카카오톡 채팅창을 먼저 열어 주세요.")
             return
+        # Put recognizable KakaoTalk windows first, but show all the others
+        # since Store-hosted windows may belong to another process name.
         candidates = sorted(candidates, key=lambda w: (not looks_like_kakao(w), w.left, w.top))
         descriptions = [
-            f"{i + 1:02d} | {w.process[:25]} | 위치 {w.left},{w.top} | {w.width}x{w.height} | {(w.title or '제목 없음')[:35]}"
+            f"{i+1:02d} | {w.process[:25]} | 위치 {w.left},{w.top} | {w.width}x{w.height} | "
+            f"{(w.title or '제목 없음')[:35]}"
             for i, w in enumerate(candidates)
         ]
         dialog = tk.Toplevel(self.root)
-        dialog.title("카카오톡 채팅창 지정 · v3.5")
+        dialog.title("카카오톡 채팅창 지정 · v3.6")
         dialog.geometry("930x245")
         dialog.transient(self.root)
         dialog.grab_set()
@@ -289,7 +353,7 @@ class App:
         frame.pack(fill="both", expand=True)
         ttk.Label(frame, text="열려 있는 창에서 카카오톡의 NOL 알림과 여기어때 창을 각각 골라 주세요.").pack(anchor="w", pady=(0, 8))
         ttk.Label(frame, text="카톡 창을 왼쪽·오른쪽에 두고, '위치'와 프로세스 이름으로 구분하세요. 다른 창은 선택하지 마세요.").pack(anchor="w", pady=(0, 12))
-        chosen = {}
+        chosen: dict[str, ttk.Combobox] = {}
         for title in CHAT_TITLES:
             row = ttk.Frame(frame)
             row.pack(fill="x", pady=4)
@@ -301,21 +365,21 @@ class App:
                     combo.current(i)
                     break
             chosen[title] = combo
-
         def save_selection():
-            indexes = [c.current() for c in chosen.values()]
+            indexes = [combo.current() for combo in chosen.values()]
             if any(i < 0 for i in indexes) or indexes[0] == indexes[1]:
                 messagebox.showwarning("창 선택", "NOL 알림과 여기어때를 서로 다른 창으로 지정해야 합니다.", parent=dialog)
                 return
             self.pc_selected_windows = {title: candidates[chosen[title].current()].hwnd for title in CHAT_TITLES}
             self.pc_verified_preview = False
+            if self.pc_preview_events is not None:
+                self.pc_preview_events = ()
             self.pc_streak.clear()
             self.pc_queue.clear()
             self.pc_label.configure(text="창 직접 선택 완료 · 화면 읽기 테스트로 채팅방 이름을 검증하세요 · 자동기록 OFF")
             self.pc_write.set(False)
             self._log("카카오톡 채팅창 2개를 직접 지정했습니다. 화면 읽기 테스트로 확인하세요.")
             dialog.destroy()
-
         bottom = ttk.Frame(frame)
         bottom.pack(fill="x", pady=(12, 0))
         ttk.Button(bottom, text="선택 완료", command=save_selection).pack(side="left")
@@ -325,6 +389,8 @@ class App:
     def _pc_clear_selection(self, dialog):
         self.pc_selected_windows.clear()
         self.pc_verified_preview = False
+        if self.pc_preview_events is not None:
+            self.pc_preview_events = ()
         self.pc_streak.clear()
         self.pc_queue.clear()
         self.pc_write.set(False)
@@ -337,6 +403,9 @@ class App:
             self._log("이미 OCR 화면 분석 중입니다.")
             return
         self.pc_requested_manual_scan = True
+        self.pc_verified_preview = False
+        self.pc_preview_events = ()
+        self.pc_preview_text = self.text.get("1.0", "end")
         self.pc_label.configure(text="화면 읽기 진행 중 · 프로그램 화면을 잠깐 숨깁니다.")
         self.root.withdraw()  # Hide *our own* window to avoid obscuring the chat screenshots.
         self.root.after(700, self._pc_launch_manual_scan)
@@ -374,6 +443,8 @@ class App:
                     blocks = [f"[{o.title}] OCR 결과 (직접 검토 필요)\n{o.visible_text}" for o in observations]
                     self.text.delete("1.0", "end")
                     self.text.insert("1.0", "\n\n--------\n\n".join(blocks))
+                    self.pc_preview_events = tuple(seen.values())
+                    self.pc_preview_text = self.text.get("1.0", "end")
                     self._log(f"화면 읽기 테스트: 카카오톡 {len(observations)}개 창 / 예약 {len(seen)}건")
                     for o in issues:
                         self._log(f"{o.title}: {o.warning}")
@@ -391,6 +462,9 @@ class App:
                         self.pc_queue.append(res)
                 self.pc_scan_error = ""
             except Exception as exc:
+                if manual:
+                    self.pc_verified_preview = False
+                    self.pc_preview_events = ()
                 msg = str(exc)
                 if manual or msg != self.pc_scan_error:
                     self._log("PC 화면 감시: " + msg)
